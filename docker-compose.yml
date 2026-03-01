@@ -1,0 +1,95 @@
+services:
+  db:
+    image: mysql:8.0
+    container_name: parking_db
+    environment:
+      MYSQL_ROOT_PASSWORD: GparkingApp
+      MYSQL_DATABASE: parking_db
+      MYSQL_USER: parking_app
+      MYSQL_PASSWORD: parking_app321
+    volumes:
+      - ./mysql-data:/var/lib/mysql
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  db_phpmyadmin:
+    image: phpmyadmin/phpmyadmin
+    container_name: parking_db_phpmyadmin
+    ports:
+      - "8081:80"
+    depends_on:
+      - db
+    environment:
+      PMA_HOST: db
+      PMA_USER: parking_app
+      PMA_PASSWORD: parking_app321
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: parking_server
+    depends_on:
+      - db
+    environment:
+      DB_HOST: db
+      DB_PORT: 3306
+      DB_USER: parking_app
+      DB_PASSWORD: parking_app321
+      DB_NAME: parking_db
+      JWT_SECRET: parking_v2DZ9at7Wg
+    ports:
+      - "5000:5000"
+    restart: unless-stopped
+    volumes:
+      - ./server:/app
+    command: sh -c "npm run db:seed && npm start"
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  client:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+    container_name: parking_client
+    depends_on:
+      - server
+    ports:
+      - "3000:3000"
+    environment:
+      VITE_API_URL: http://server:5000
+    restart: unless-stopped
+    volumes:
+      - ./client:/app
+      - /app/node_modules
+    command: npm run dev
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
