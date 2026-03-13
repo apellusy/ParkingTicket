@@ -7,15 +7,21 @@ import Loading from '../components/common/Loading';
 import { adminService, ticketService } from '../services/api';
 import { showError, showSuccess } from '../utils/alerts';
 import {
-  loadRegulations,
+  fetchRegulations,
+  DEFAULT_REGULATIONS,
   shouldFireAutoReport,
   markReportDelivered,
   formatDuration,
 } from '../utils/regulations';
+import {
+  getCachedDashboard,
+  getCachedRegulations,
+  invalidateDashboardCache,
+} from '../utils/dashboardCache';
 
 ChartJS.register(ArcElement, Tooltip, Legend, CategoryScale, LinearScale, BarElement);
 
-const AUTO_REPORT_CHECK_INTERVAL_MS = 60 * 1000; // check every minute
+const AUTO_REPORT_CHECK_INTERVAL_MS = 60 * 1000;
 const FETCH_INTERVAL_MS = 30 * 1000;
 
 const vehicleTypeMap = {
@@ -25,62 +31,94 @@ const vehicleTypeMap = {
   suv: 'SUV',
 };
 
+// Raw fetcher passed into the cache layer
+async function fetchDashboardData() {
+  const [dashRes, lostRes] = await Promise.all([
+    adminService.getDashboard(),
+    ticketService.search({ status: 'lost', limit: 100 }),
+  ]);
+  return {
+    stats:       dashRes.data.success ? dashRes.data.data            : null,
+    lostTickets: lostRes.data.success ? lostRes.data.data.tickets || [] : [],
+  };
+}
+
 const AdminDashboard = () => {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [stats, setStats] = useState(null);
   const [lostTickets, setLostTickets] = useState([]);
 
-  // Auto-report modal
   const [showReportModal, setShowReportModal] = useState(false);
   const [reportTriggeredAt, setReportTriggeredAt] = useState(null);
-
-  // Delete all lost tickets modal
   const [showDeleteAllModal, setShowDeleteAllModal] = useState(false);
   const [deletingAll, setDeletingAll] = useState(false);
-
-  // Notification bell state
   const [showNotifDropdown, setShowNotifDropdown] = useState(false);
   const notifRef = useRef(null);
 
-  // ─── Data Fetching ──────────────────────────────────────────────────────
+  const [regulations, setRegulations] = useState(DEFAULT_REGULATIONS);
+  const regulationsRef = useRef(DEFAULT_REGULATIONS);
 
-  const fetchDashboard = useCallback(async (silent = false) => {
+  // Dashboard fetch goes through the cache layer
+  // if the data is < 30 seconds old. After 30s it silently refreshes.
+  const loadDashboard = useCallback(async (silent = false, force = false) => {
     try {
-      const [dashRes, lostRes] = await Promise.all([
-        adminService.getDashboard(),
-        ticketService.search({ status: 'lost', limit: 100 }),
-      ]);
-      if (dashRes.data.success) setStats(dashRes.data.data);
-      if (lostRes.data.success) setLostTickets(lostRes.data.data.tickets || []);
+      const { stats: newStats, lostTickets: newLost } =
+        await getCachedDashboard(fetchDashboardData, force);
+
+      if (newStats      !== null) setStats(newStats);
+      if (newLost       !== null) setLostTickets(newLost);
     } catch {
       if (!silent) showError('Gagal memuat dashboard');
     } finally {
-      if (!silent) setLoading(false);
+      setLoading(false);
     }
   }, []);
 
+  // Regulations — cached for 5 minutes
   useEffect(() => {
-    fetchDashboard();
-    const interval = setInterval(() => fetchDashboard(true), FETCH_INTERVAL_MS);
+    getCachedRegulations(fetchRegulations).then(({ regs }) => {
+      setRegulations(regs);
+      regulationsRef.current = regs;
+      if (shouldFireAutoReport(regs)) {
+        markReportDelivered();
+        setReportTriggeredAt(new Date());
+        setShowReportModal(true);
+      }
+    });
+  }, []);
+
+  // Mount: show cached data instantly, refresh silently if stale
+  useEffect(() => {
+    // Immediately check if we have something cached to show without a spinner
+    getCachedDashboard(fetchDashboardData).then(({ stats: s, lostTickets: l, fromCache }) => {
+      if (s !== null) {
+        setStats(s);
+        setLostTickets(l);
+        setLoading(false);
+      }
+      // If data came from cache it might be stale — fire a background refresh
+      if (fromCache) {
+        loadDashboard(true);
+      }
+    }).catch(() => {
+      setLoading(false);
+    });
+
+    // Poll for live updates every 30s while the page is open
+    const interval = setInterval(() => loadDashboard(true), FETCH_INTERVAL_MS);
     return () => clearInterval(interval);
-  }, [fetchDashboard]);
+  }, [loadDashboard]);
 
-  // ─── Auto-Report Engine ─────────────────────────────────────────────────
-
+  // Auto-report interval uses in-memory ref, no API call
   const checkAndFireReport = useCallback(() => {
-    const regulations = loadRegulations();
-    if (!shouldFireAutoReport(regulations)) return;
-
-    // Mark delivered first to prevent double-firing across tab instances
+    if (!shouldFireAutoReport(regulationsRef.current)) return;
     markReportDelivered();
-
     setReportTriggeredAt(new Date());
     setShowReportModal(true);
   }, []);
 
   useEffect(() => {
-    checkAndFireReport(); // check on mount
     const interval = setInterval(checkAndFireReport, AUTO_REPORT_CHECK_INTERVAL_MS);
     return () => clearInterval(interval);
   }, [checkAndFireReport]);
@@ -88,16 +126,14 @@ const AdminDashboard = () => {
   // Close notif dropdown on outside click
   useEffect(() => {
     const handler = (e) => {
-      if (notifRef.current && !notifRef.current.contains(e.target)) {
+      if (notifRef.current && !notifRef.current.contains(e.target))
         setShowNotifDropdown(false);
-      }
     };
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
   }, []);
 
-  // ─── Delete All Lost Tickets ────────────────────────────────────────────
-
+  // Delete all lost
   const handleDeleteAllLost = async () => {
     if (lostTickets.length === 0) return;
     setDeletingAll(true);
@@ -106,19 +142,17 @@ const AdminDashboard = () => {
         lostTickets.map((t) => ticketService.delete(t.id))
       );
       const succeeded = results.filter((r) => r.status === 'fulfilled').length;
-      const failed = results.length - succeeded;
-
-      if (succeeded > 0) {
-        showSuccess(
-          `${succeeded} tiket hilang berhasil dihapus${failed > 0 ? `, ${failed} gagal` : ''}`
-        );
-      } else {
+      const failed    = results.length - succeeded;
+      if (succeeded > 0)
+        showSuccess(`${succeeded} tiket hilang berhasil dihapus${failed > 0 ? `, ${failed} gagal` : ''}`);
+      else
         showError('Semua penghapusan gagal');
-      }
 
       setShowDeleteAllModal(false);
       setShowReportModal(false);
-      await fetchDashboard(true);
+      // Invalidate cache so the next load hits the API for fresh data
+      invalidateDashboardCache();
+      await loadDashboard(true, true);
     } catch {
       showError('Gagal menghapus tiket');
     } finally {
@@ -126,38 +160,28 @@ const AdminDashboard = () => {
     }
   };
 
-  // ─── Chart Data ─────────────────────────────────────────────────────────
-
+  // Chart
   const vehicleChartData = {
     labels: stats?.vehicleDistribution?.map((v) => vehicleTypeMap[v.vehicleType] || v.vehicleType) || [],
-    datasets: [
-      {
-        data: stats?.vehicleDistribution?.map((v) => v.count) || [],
-        backgroundColor: ['#3b82f6', '#f97316', '#10b981', '#8b5cf6'],
-        borderWidth: 0,
-      },
-    ],
+    datasets: [{
+      data: stats?.vehicleDistribution?.map((v) => v.count) || [],
+      backgroundColor: ['#3b82f6', '#f97316', '#10b981', '#8b5cf6'],
+      borderWidth: 0,
+    }],
   };
 
-  const regulations = loadRegulations();
-
   if (loading) return <Loading fullScreen text="Memuat dashboard..." />;
-
-  // ─── Render ─────────────────────────────────────────────────────────────
 
   return (
     <div className="min-h-screen bg-gray-50">
       <Sidebar isOpen={sidebarOpen} onClose={() => setSidebarOpen(false)} />
 
       <div className="lg:ml-[260px]">
-        {/* Top Bar */}
+        {/* Header */}
         <header className="bg-white border-b border-gray-200 sticky top-0 z-10">
           <div className="flex items-center justify-between px-5 py-3">
             <div className="flex items-center gap-3">
-              <button
-                onClick={() => setSidebarOpen(true)}
-                className="lg:hidden p-1.5 rounded-lg hover:bg-gray-100"
-              >
+              <button onClick={() => setSidebarOpen(true)} className="lg:hidden p-1.5 rounded-lg hover:bg-gray-100">
                 <i className="fas fa-bars text-gray-600 text-sm"></i>
               </button>
               <h1 className="text-lg font-bold text-gray-900">Dashboard</h1>
@@ -165,15 +189,10 @@ const AdminDashboard = () => {
 
             <div className="flex items-center gap-3">
               <span className="text-xs text-gray-500 hidden sm:block">
-                {new Date().toLocaleDateString('id-ID', {
-                  weekday: 'short',
-                  year: 'numeric',
-                  month: 'short',
-                  day: 'numeric',
-                })}
+                {new Date().toLocaleDateString('id-ID', { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' })}
               </span>
 
-              {/* Notification Bell */}
+              {/* Notification bell */}
               <div className="relative" ref={notifRef}>
                 <button
                   onClick={() => setShowNotifDropdown((v) => !v)}
@@ -188,17 +207,14 @@ const AdminDashboard = () => {
                   )}
                 </button>
 
-                {/* Notif Dropdown */}
                 {showNotifDropdown && (
                   <div className="absolute right-0 top-full mt-2 w-80 bg-white rounded-xl shadow-xl border border-gray-100 z-20 overflow-hidden">
                     <div className="px-4 py-3 bg-gray-50 border-b border-gray-100 flex items-center justify-between">
                       <span className="font-semibold text-sm text-gray-900">
-                        <i className="fas fa-exclamation-circle text-red-500 mr-1.5"></i>
-                        Tiket Hilang
+                        <i className="fas fa-exclamation-circle text-red-500 mr-1.5"></i>Tiket Hilang
                       </span>
                       <span className="text-xs text-gray-500">{lostTickets.length} tiket</span>
                     </div>
-
                     {lostTickets.length === 0 ? (
                       <div className="px-4 py-6 text-center text-gray-400 text-xs">
                         <i className="fas fa-check-circle text-2xl mb-2 block text-green-400"></i>
@@ -208,10 +224,7 @@ const AdminDashboard = () => {
                       <>
                         <div className="max-h-64 overflow-y-auto">
                           {lostTickets.slice(0, 8).map((ticket) => (
-                            <div
-                              key={ticket.id}
-                              className="flex items-center justify-between px-4 py-2.5 border-b border-gray-50 hover:bg-gray-50"
-                            >
+                            <div key={ticket.id} className="flex items-center justify-between px-4 py-2.5 border-b border-gray-50 hover:bg-gray-50">
                               <div>
                                 <p className="font-semibold text-xs text-gray-900">{ticket.plateNumber}</p>
                                 <p className="text-xs text-gray-400 font-mono">{ticket.ticketNumber}</p>
@@ -223,30 +236,18 @@ const AdminDashboard = () => {
                             </div>
                           ))}
                           {lostTickets.length > 8 && (
-                            <p className="text-center text-xs text-gray-400 py-2">
-                              +{lostTickets.length - 8} lainnya
-                            </p>
+                            <p className="text-center text-xs text-gray-400 py-2">+{lostTickets.length - 8} lainnya</p>
                           )}
                         </div>
                         <div className="px-4 py-3 bg-gray-50 border-t border-gray-100 flex gap-2">
                           <button
-                            onClick={() => {
-                              setShowNotifDropdown(false);
-                              setShowReportModal(true);
-                            }}
+                            onClick={() => { setShowNotifDropdown(false); setShowReportModal(true); }}
                             className="flex-1 text-xs text-center py-1.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
-                          >
-                            Lihat Laporan
-                          </button>
+                          >Lihat Laporan</button>
                           <button
-                            onClick={() => {
-                              setShowNotifDropdown(false);
-                              setShowDeleteAllModal(true);
-                            }}
+                            onClick={() => { setShowNotifDropdown(false); setShowDeleteAllModal(true); }}
                             className="flex-1 text-xs text-center py-1.5 bg-red-100 text-red-700 rounded-lg hover:bg-red-200 transition-colors"
-                          >
-                            Hapus Semua
-                          </button>
+                          >Hapus Semua</button>
                         </div>
                       </>
                     )}
@@ -257,7 +258,7 @@ const AdminDashboard = () => {
           </div>
         </header>
 
-        {/* ── Auto-Report Banner ────────────────────────────────────────────── */}
+        {/* Lost tickets banner */}
         {regulations.autoReport.enabled && lostTickets.length > 0 && !showReportModal && (
           <div className="mx-5 mt-4 bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 flex items-center justify-between gap-3">
             <div className="flex items-center gap-2.5">
@@ -269,23 +270,19 @@ const AdminDashboard = () => {
                   {lostTickets.length} tiket hilang memerlukan perhatian
                 </p>
                 <p className="text-xs text-amber-600">
-                  Laporan otomatis dijadwalkan pukul{' '}
-                  <strong>{regulations.autoReport.reportTime}</strong>
+                  Laporan otomatis dijadwalkan pukul <strong>{regulations.autoReport.reportTime}</strong>
                 </p>
               </div>
             </div>
             <button
               onClick={() => setShowReportModal(true)}
               className="flex-shrink-0 text-xs font-medium px-3 py-1.5 bg-amber-600 text-white rounded-lg hover:bg-amber-700 transition-colors"
-            >
-              Lihat Laporan
-            </button>
+            >Lihat Laporan</button>
           </div>
         )}
 
-        {/* Dashboard Content */}
         <div className="p-5 space-y-5">
-          {/* Stats Cards */}
+          {/* Stats */}
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
             <div className="bg-white rounded-xl p-4 shadow-sm">
               <div className="flex items-center justify-between">
@@ -299,10 +296,7 @@ const AdminDashboard = () => {
               </div>
               <div className="mt-2 flex items-center gap-2">
                 <div className="flex-1 bg-gray-200 rounded-full h-1.5">
-                  <div
-                    className="bg-blue-500 h-1.5 rounded-full transition-all"
-                    style={{ width: `${Math.min(stats?.occupancyPercent || 0, 100)}%` }}
-                  ></div>
+                  <div className="bg-blue-500 h-1.5 rounded-full transition-all" style={{ width: `${Math.min(stats?.occupancyPercent || 0, 100)}%` }}></div>
                 </div>
                 <span className="text-xs text-gray-500">{stats?.occupancyPercent || 0}%</span>
               </div>
@@ -325,9 +319,7 @@ const AdminDashboard = () => {
               <div className="flex items-center justify-between">
                 <div>
                   <p className="text-gray-500 text-xs">Pendapatan Hari Ini</p>
-                  <p className="text-xl font-bold text-gray-900 mt-1">
-                    {stats?.today?.formattedRevenue || 'Rp. 0'}
-                  </p>
+                  <p className="text-xl font-bold text-gray-900 mt-1">{stats?.today?.formattedRevenue || 'Rp. 0'}</p>
                 </div>
                 <div className="w-10 h-10 rounded-lg bg-purple-100 flex items-center justify-center">
                   <i className="fas fa-wallet text-purple-600"></i>
@@ -336,158 +328,78 @@ const AdminDashboard = () => {
               <p className="text-xs text-gray-500 mt-2">{stats?.today?.payments || 0} transaksi</p>
             </div>
 
-            {/* Lost Tickets Card */}
             <div
-              className={`rounded-xl p-4 shadow-sm cursor-pointer transition-colors ${
-                lostTickets.length > 0
-                  ? 'bg-red-50 border border-red-100 hover:bg-red-100'
-                  : 'bg-white hover:bg-gray-50'
-              }`}
+              className={`rounded-xl p-4 shadow-sm cursor-pointer transition-colors ${lostTickets.length > 0 ? 'bg-red-50 border border-red-100 hover:bg-red-100' : 'bg-white hover:bg-gray-50'}`}
               onClick={() => lostTickets.length > 0 && setShowReportModal(true)}
             >
               <div className="flex items-center justify-between">
                 <div>
-                  <p className={`text-xs ${lostTickets.length > 0 ? 'text-red-500' : 'text-gray-500'}`}>
-                    Tiket Hilang
-                  </p>
-                  <p
-                    className={`text-2xl font-bold mt-1 ${
-                      lostTickets.length > 0 ? 'text-red-600' : 'text-gray-900'
-                    }`}
-                  >
+                  <p className={`text-xs ${lostTickets.length > 0 ? 'text-red-500' : 'text-gray-500'}`}>Tiket Hilang</p>
+                  <p className={`text-2xl font-bold mt-1 ${lostTickets.length > 0 ? 'text-red-600' : 'text-gray-900'}`}>
                     {lostTickets.length}
                   </p>
                 </div>
-                <div
-                  className={`w-10 h-10 rounded-lg flex items-center justify-center ${
-                    lostTickets.length > 0 ? 'bg-red-100' : 'bg-gray-100'
-                  }`}
-                >
-                  <i
-                    className={`fas fa-exclamation-circle ${
-                      lostTickets.length > 0 ? 'text-red-600' : 'text-gray-400'
-                    }`}
-                  ></i>
+                <div className={`w-10 h-10 rounded-lg flex items-center justify-center ${lostTickets.length > 0 ? 'bg-red-100' : 'bg-gray-100'}`}>
+                  <i className={`fas fa-exclamation-circle ${lostTickets.length > 0 ? 'text-red-600' : 'text-gray-400'}`}></i>
                 </div>
               </div>
               {lostTickets.length > 0 ? (
-                <p className="text-xs text-red-500 mt-2 font-medium">
-                  <i className="fas fa-arrow-right mr-0.5"></i>
-                  Klik untuk lihat laporan
-                </p>
+                <p className="text-xs text-red-500 mt-2 font-medium"><i className="fas fa-arrow-right mr-0.5"></i>Klik untuk lihat laporan</p>
               ) : (
                 <p className="text-xs text-gray-400 mt-2">Tidak ada tiket hilang</p>
               )}
             </div>
           </div>
 
-          {/* Charts & Quick Actions Row */}
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-            {/* Vehicle Distribution */}
             <div className="bg-white rounded-xl p-4 shadow-sm">
               <h3 className="font-semibold text-gray-900 text-sm mb-3">Distribusi Kendaraan</h3>
               <div className="h-40">
                 {stats?.vehicleDistribution?.length > 0 ? (
-                  <Doughnut
-                    data={vehicleChartData}
-                    options={{
-                      plugins: {
-                        legend: {
-                          position: 'bottom',
-                          labels: { font: { size: 10 }, padding: 8 },
-                        },
-                      },
-                      maintainAspectRatio: false,
-                    }}
-                  />
+                  <Doughnut data={vehicleChartData} options={{ plugins: { legend: { position: 'bottom', labels: { font: { size: 10 }, padding: 8 } } }, maintainAspectRatio: false }} />
                 ) : (
-                  <div className="h-full flex items-center justify-center text-gray-400 text-sm">
-                    Belum ada data
-                  </div>
+                  <div className="h-full flex items-center justify-center text-gray-400 text-sm">Belum ada data</div>
                 )}
               </div>
             </div>
 
-            {/* Quick Actions */}
             <div className="bg-white rounded-xl p-4 shadow-sm">
               <h3 className="font-semibold text-gray-900 text-sm mb-3">Aksi Cepat</h3>
               <div className="space-y-2">
-                <Link
-                  to="/entry"
-                  className="flex items-center gap-2.5 p-2.5 rounded-lg bg-blue-50 hover:bg-blue-100 transition-colors"
-                >
-                  <div className="w-8 h-8 rounded bg-blue-500 flex items-center justify-center">
-                    <i className="fas fa-plus text-white text-xs"></i>
-                  </div>
-                  <div>
-                    <p className="font-medium text-gray-900 text-xs">Entry</p>
-                    <p className="text-xs text-gray-500">Tiket baru</p>
-                  </div>
-                </Link>
-                <Link
-                  to="/exit"
-                  className="flex items-center gap-2.5 p-2.5 rounded-lg bg-green-50 hover:bg-green-100 transition-colors"
-                >
-                  <div className="w-8 h-8 rounded bg-green-500 flex items-center justify-center">
-                    <i className="fas fa-sign-out-alt text-white text-xs"></i>
-                  </div>
-                  <div>
-                    <p className="font-medium text-gray-900 text-xs">Exit</p>
-                    <p className="text-xs text-gray-500">Keluar & bayar</p>
-                  </div>
-                </Link>
-                <Link
-                  to="/admin/tickets"
-                  className="flex items-center gap-2.5 p-2.5 rounded-lg bg-purple-50 hover:bg-purple-100 transition-colors"
-                >
-                  <div className="w-8 h-8 rounded bg-purple-500 flex items-center justify-center">
-                    <i className="fas fa-list text-white text-xs"></i>
-                  </div>
-                  <div>
-                    <p className="font-medium text-gray-900 text-xs">Tiket</p>
-                    <p className="text-xs text-gray-500">Semua kendaraan</p>
-                  </div>
-                </Link>
+                {[
+                  { to: '/entry', icon: 'fa-plus', color: 'blue', label: 'Entry', sub: 'Tiket baru' },
+                  { to: '/exit', icon: 'fa-sign-out-alt', color: 'green', label: 'Exit', sub: 'Keluar & bayar' },
+                  { to: '/admin/tickets', icon: 'fa-list', color: 'purple', label: 'Tiket', sub: 'Semua kendaraan' },
+                ].map(({ to, icon, color, label, sub }) => (
+                  <Link key={to} to={to} className={`flex items-center gap-2.5 p-2.5 rounded-lg bg-${color}-50 hover:bg-${color}-100 transition-colors`}>
+                    <div className={`w-8 h-8 rounded bg-${color}-500 flex items-center justify-center`}>
+                      <i className={`fas ${icon} text-white text-xs`}></i>
+                    </div>
+                    <div>
+                      <p className="font-medium text-gray-900 text-xs">{label}</p>
+                      <p className="text-xs text-gray-500">{sub}</p>
+                    </div>
+                  </Link>
+                ))}
               </div>
             </div>
 
-            {/* Recent Activity */}
             <div className="bg-white rounded-xl p-4 shadow-sm">
               <h3 className="font-semibold text-gray-900 text-sm mb-3">Aktivitas Terbaru</h3>
               <div className="space-y-2 max-h-48 overflow-y-auto">
                 {stats?.recentActivity?.length > 0 ? (
                   stats.recentActivity.map((activity, index) => (
-                    <div
-                      key={index}
-                      className="flex items-start gap-2 pb-2 border-b border-gray-100 last:border-0"
-                    >
-                      <div
-                        className={`w-6 h-6 rounded-full flex items-center justify-center text-xs flex-shrink-0 ${
-                          activity.action.includes('PAYMENT')
-                            ? 'bg-green-100 text-green-600'
-                            : activity.action.includes('TICKET')
-                            ? 'bg-blue-100 text-blue-600'
-                            : 'bg-gray-100 text-gray-600'
-                        }`}
-                      >
-                        <i
-                          className={`fas ${
-                            activity.action.includes('PAYMENT')
-                              ? 'fa-money-bill'
-                              : activity.action.includes('TICKET')
-                              ? 'fa-ticket'
-                              : 'fa-circle'
-                          }`}
-                        ></i>
+                    <div key={index} className="flex items-start gap-2 pb-2 border-b border-gray-100 last:border-0">
+                      <div className={`w-6 h-6 rounded-full flex items-center justify-center text-xs flex-shrink-0 ${
+                        activity.action.includes('PAYMENT') ? 'bg-green-100 text-green-600' :
+                        activity.action.includes('TICKET') ? 'bg-blue-100 text-blue-600' : 'bg-gray-100 text-gray-600'
+                      }`}>
+                        <i className={`fas ${activity.action.includes('PAYMENT') ? 'fa-money-bill' : activity.action.includes('TICKET') ? 'fa-ticket' : 'fa-circle'}`}></i>
                       </div>
                       <div className="flex-1 min-w-0">
                         <p className="text-xs text-gray-900 truncate">{activity.action}</p>
                         <p className="text-xs text-gray-500">
-                          {activity.user} •{' '}
-                          {new Date(activity.createdAt).toLocaleTimeString('id-ID', {
-                            hour: '2-digit',
-                            minute: '2-digit',
-                          })}
+                          {activity.user} • {new Date(activity.createdAt).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })}
                         </p>
                       </div>
                     </div>
@@ -501,14 +413,11 @@ const AdminDashboard = () => {
         </div>
       </div>
 
-      {/* ── Lost Ticket Report Modal ──────────────────────────────────────────── */}
+      {/* Report Modal */}
       {showReportModal && (
-        <div
-          className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4"
-          onClick={(e) => e.target === e.currentTarget && setShowReportModal(false)}
-        >
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4"
+          onClick={(e) => e.target === e.currentTarget && setShowReportModal(false)}>
           <div className="bg-white rounded-2xl w-full max-w-2xl max-h-[90vh] flex flex-col shadow-2xl overflow-hidden">
-            {/* Header */}
             <div className="bg-gradient-to-r from-red-600 to-rose-600 px-6 py-5 text-white flex-shrink-0">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-3">
@@ -519,37 +428,20 @@ const AdminDashboard = () => {
                     <h3 className="font-bold text-lg">Laporan Tiket Hilang</h3>
                     <p className="text-red-100 text-xs">
                       {reportTriggeredAt
-                        ? `Dilaporkan otomatis pada ${reportTriggeredAt.toLocaleTimeString('id-ID', {
-                            hour: '2-digit',
-                            minute: '2-digit',
-                          })} • ${reportTriggeredAt.toLocaleDateString('id-ID')}`
+                        ? `Dilaporkan otomatis pada ${reportTriggeredAt.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })} • ${reportTriggeredAt.toLocaleDateString('id-ID')}`
                         : `Dibuka manual • ${new Date().toLocaleDateString('id-ID')}`}
                     </p>
                   </div>
                 </div>
-                <button
-                  onClick={() => setShowReportModal(false)}
-                  className="text-white/70 hover:text-white text-xl leading-none"
-                >
+                <button onClick={() => setShowReportModal(false)} className="text-white/70 hover:text-white text-xl leading-none">
                   <i className="fas fa-times"></i>
                 </button>
               </div>
-
-              {/* Summary stats */}
               <div className="grid grid-cols-3 gap-3 mt-4">
                 {[
                   { label: 'Total Hilang', value: lostTickets.length, icon: 'fa-ticket' },
-                  {
-                    label: 'Motor',
-                    value: lostTickets.filter((t) => t.vehicleType === 'motorcycle').length,
-                    icon: 'fa-motorcycle',
-                  },
-                  {
-                    label: 'Mobil / SUV',
-                    value: lostTickets.filter((t) => ['car', 'suv', 'truck'].includes(t.vehicleType))
-                      .length,
-                    icon: 'fa-car',
-                  },
+                  { label: 'Motor', value: lostTickets.filter((t) => t.vehicleType === 'motorcycle').length, icon: 'fa-motorcycle' },
+                  { label: 'Mobil / SUV', value: lostTickets.filter((t) => ['car', 'suv', 'truck'].includes(t.vehicleType)).length, icon: 'fa-car' },
                 ].map((s) => (
                   <div key={s.label} className="bg-white/10 rounded-lg px-3 py-2 text-center">
                     <i className={`fas ${s.icon} text-white/70 text-xs mb-1 block`}></i>
@@ -560,7 +452,6 @@ const AdminDashboard = () => {
               </div>
             </div>
 
-            {/* Ticket List */}
             <div className="flex-1 overflow-y-auto">
               {lostTickets.length === 0 ? (
                 <div className="flex flex-col items-center justify-center py-12 text-gray-400">
@@ -573,36 +464,22 @@ const AdminDashboard = () => {
                   <table className="w-full text-sm">
                     <thead className="bg-gray-50 border-b border-gray-100 sticky top-0">
                       <tr>
-                        <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">No. Tiket</th>
-                        <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Plat</th>
-                        <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Jenis</th>
-                        <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Waktu Masuk</th>
-                        <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Durasi</th>
+                        {['No. Tiket', 'Plat', 'Jenis', 'Waktu Masuk', 'Durasi'].map((h) => (
+                          <th key={h} className="px-4 py-3 text-left text-xs font-semibold text-gray-600">{h}</th>
+                        ))}
                       </tr>
                     </thead>
                     <tbody>
                       {lostTickets.map((ticket) => (
                         <tr key={ticket.id} className="border-b border-gray-50 hover:bg-red-50 transition-colors">
-                          <td className="px-4 py-3 font-mono text-xs text-blue-600 font-semibold">
-                            {ticket.ticketNumber}
-                          </td>
+                          <td className="px-4 py-3 font-mono text-xs text-blue-600 font-semibold">{ticket.ticketNumber}</td>
                           <td className="px-4 py-3 font-bold text-gray-900">{ticket.plateNumber}</td>
-                          <td className="px-4 py-3 text-xs text-gray-600">
-                            {vehicleTypeMap[ticket.vehicleType] || ticket.vehicleType}
-                          </td>
+                          <td className="px-4 py-3 text-xs text-gray-600">{vehicleTypeMap[ticket.vehicleType] || ticket.vehicleType}</td>
                           <td className="px-4 py-3 text-xs text-gray-500">
-                            {new Date(ticket.entryTime).toLocaleString('id-ID', {
-                              day: '2-digit',
-                              month: '2-digit',
-                              year: 'numeric',
-                              hour: '2-digit',
-                              minute: '2-digit',
-                            })}
+                            {new Date(ticket.entryTime).toLocaleString('id-ID', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
                           </td>
                           <td className="px-4 py-3">
-                            <span className="text-xs font-semibold text-red-500">
-                              {formatDuration(ticket.entryTime)}
-                            </span>
+                            <span className="text-xs font-semibold text-red-500">{formatDuration(ticket.entryTime)}</span>
                           </td>
                         </tr>
                       ))}
@@ -612,32 +489,19 @@ const AdminDashboard = () => {
               )}
             </div>
 
-            {/* Footer actions */}
             <div className="flex-shrink-0 px-6 py-4 bg-gray-50 border-t border-gray-100 flex gap-3">
               {lostTickets.length > 0 && (
-                <button
-                  onClick={() => {
-                    setShowReportModal(false);
-                    setShowDeleteAllModal(true);
-                  }}
-                  className="flex items-center gap-1.5 px-4 py-2 text-sm font-medium bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors"
-                >
-                  <i className="fas fa-trash-alt"></i>
-                  Hapus Semua ({lostTickets.length})
+                <button onClick={() => { setShowReportModal(false); setShowDeleteAllModal(true); }}
+                  className="flex items-center gap-1.5 px-4 py-2 text-sm font-medium bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors">
+                  <i className="fas fa-trash-alt"></i>Hapus Semua ({lostTickets.length})
                 </button>
               )}
-              <Link
-                to="/admin/tickets"
-                onClick={() => setShowReportModal(false)}
-                className="flex items-center gap-1.5 px-4 py-2 text-sm font-medium bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
-              >
-                <i className="fas fa-external-link-alt"></i>
-                Kelola Tiket
+              <Link to="/admin/tickets" onClick={() => setShowReportModal(false)}
+                className="flex items-center gap-1.5 px-4 py-2 text-sm font-medium bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors">
+                <i className="fas fa-external-link-alt"></i>Kelola Tiket
               </Link>
-              <button
-                onClick={() => setShowReportModal(false)}
-                className="ml-auto flex items-center gap-1.5 px-4 py-2 text-sm font-medium bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300 transition-colors"
-              >
+              <button onClick={() => setShowReportModal(false)}
+                className="ml-auto flex items-center gap-1.5 px-4 py-2 text-sm font-medium bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300 transition-colors">
                 Tutup
               </button>
             </div>
@@ -645,12 +509,10 @@ const AdminDashboard = () => {
         </div>
       )}
 
-      {/* ── Delete All Lost Confirmation Modal ──────────────────────────────── */}
+      {/* Delete All Modal */}
       {showDeleteAllModal && (
-        <div
-          className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4"
-          onClick={(e) => !deletingAll && e.target === e.currentTarget && setShowDeleteAllModal(false)}
-        >
+        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4"
+          onClick={(e) => !deletingAll && e.target === e.currentTarget && setShowDeleteAllModal(false)}>
           <div className="bg-white rounded-2xl max-w-md w-full shadow-2xl overflow-hidden">
             <div className="bg-red-600 px-6 py-5 text-white">
               <div className="flex items-center gap-3">
@@ -663,14 +525,10 @@ const AdminDashboard = () => {
                 </div>
               </div>
             </div>
-
             <div className="p-6">
               <p className="text-gray-700 text-sm mb-4">
-                Anda akan menghapus{' '}
-                <strong className="text-red-600">{lostTickets.length} tiket hilang</strong> dari
-                sistem. Data yang dihapus tidak dapat dipulihkan.
+                Anda akan menghapus <strong className="text-red-600">{lostTickets.length} tiket hilang</strong> dari sistem. Data yang dihapus tidak dapat dipulihkan.
               </p>
-
               <div className="bg-red-50 border border-red-100 rounded-xl p-4 mb-5 space-y-2">
                 <div className="flex justify-between text-sm">
                   <span className="text-gray-600">Total tiket dihapus</span>
@@ -678,36 +536,17 @@ const AdminDashboard = () => {
                 </div>
                 <div className="flex justify-between text-sm">
                   <span className="text-gray-600">Tanggal operasi</span>
-                  <span className="font-medium text-gray-700">
-                    {new Date().toLocaleDateString('id-ID')}
-                  </span>
+                  <span className="font-medium text-gray-700">{new Date().toLocaleDateString('id-ID')}</span>
                 </div>
               </div>
-
               <div className="flex gap-3">
-                <button
-                  onClick={() => setShowDeleteAllModal(false)}
-                  disabled={deletingAll}
-                  className="flex-1 px-4 py-2.5 text-sm font-medium bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 disabled:opacity-50 transition-colors"
-                >
+                <button onClick={() => setShowDeleteAllModal(false)} disabled={deletingAll}
+                  className="flex-1 px-4 py-2.5 text-sm font-medium bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 disabled:opacity-50 transition-colors">
                   Batal
                 </button>
-                <button
-                  onClick={handleDeleteAllLost}
-                  disabled={deletingAll}
-                  className="flex-1 px-4 py-2.5 text-sm font-medium bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:bg-red-400 transition-colors flex items-center justify-center gap-2"
-                >
-                  {deletingAll ? (
-                    <>
-                      <i className="fas fa-spinner fa-spin"></i>
-                      Menghapus…
-                    </>
-                  ) : (
-                    <>
-                      <i className="fas fa-trash-alt"></i>
-                      Hapus Semuanya
-                    </>
-                  )}
+                <button onClick={handleDeleteAllLost} disabled={deletingAll}
+                  className="flex-1 px-4 py-2.5 text-sm font-medium bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:bg-red-400 transition-colors flex items-center justify-center gap-2">
+                  {deletingAll ? <><i className="fas fa-spinner fa-spin"></i>Menghapus…</> : <><i className="fas fa-trash-alt"></i>Hapus Semuanya</>}
                 </button>
               </div>
             </div>

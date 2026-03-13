@@ -50,6 +50,7 @@ export const ticketService = {
     search: (params) => api.get('/tickets/search', { params }),
     print: (id) => api.post(`/tickets/${id}/print`),
     markLost: (id, data) => api.put(`/tickets/${id}/lost`, data),
+    delete: (id) => api.delete(`/tickets/${id}`),
     cancel: (id) => api.delete(`/tickets/${id}`)
 };
 

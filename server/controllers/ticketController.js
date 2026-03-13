@@ -1,23 +1,18 @@
-const { body, param, query } = require('express-validator');
+const { body } = require('express-validator');
 const { Op } = require('sequelize');
-const { Ticket, Payment, PlateCapture, Blacklist, MonthlyPass, ActivityLog, Rate } = require('../models');
+const { Ticket, Payment, PlateCapture, Blacklist, MonthlyPass, ActivityLog, Rate, Setting } = require('../models');
 const qrService = require('../services/qrService');
 
 // Validation rules
 const createTicketValidation = [
     body('plateNumber')
         .trim()
-        .notEmpty()
-        .withMessage('Plate number is required')
-        .isLength({ min: 2, max: 20 })
-        .withMessage('Plate number must be 2-20 characters'),
+        .notEmpty().withMessage('Plate number is required')
+        .isLength({ min: 2, max: 20 }).withMessage('Plate number must be 2-20 characters'),
     body('vehicleType')
-        .isIn(['car', 'motorcycle', 'truck', 'suv'])
-        .withMessage('Invalid vehicle type'),
+        .isIn(['car', 'motorcycle', 'truck', 'suv']).withMessage('Invalid vehicle type'),
     body('parkingSpot')
-        .optional()
-        .trim()
-        .isLength({ max: 20 })
+        .optional().trim().isLength({ max: 20 })
 ];
 
 // Create new ticket (entry)
@@ -25,7 +20,6 @@ const createTicket = async (req, res, next) => {
     try {
         const { plateNumber, vehicleType, parkingSpot, entryImagePath, notes } = req.body;
 
-        // Normalize plate number
         const normalizedPlate = plateNumber.toUpperCase().replace(/\s+/g, '');
 
         // Check blacklist
@@ -34,10 +28,21 @@ const createTicket = async (req, res, next) => {
             return res.status(403).json({
                 success: false,
                 message: 'Vehicle is blacklisted',
-                data: {
-                    reason: blacklisted.reason,
-                    severity: blacklisted.severity
-                }
+                data: { reason: blacklisted.reason, severity: blacklisted.severity }
+            });
+        }
+
+        // Check capacity
+        const [maxCapacity, activeCount] = await Promise.all([
+            Setting.get('max_capacity', 100),
+            Ticket.count({ where: { status: 'active' } })
+        ]);
+
+        if (activeCount >= parseInt(maxCapacity)) {
+            return res.status(409).json({
+                success: false,
+                message: `Parkir penuh. Kapasitas maksimum (${maxCapacity} kendaraan) telah tercapai.`,
+                data: { maxCapacity: parseInt(maxCapacity), activeCount }
             });
         }
 
@@ -46,10 +51,7 @@ const createTicket = async (req, res, next) => {
 
         // Check for existing active ticket with same plate
         const existingTicket = await Ticket.findOne({
-            where: {
-                plateNumber: normalizedPlate,
-                status: 'active'
-            }
+            where: { plateNumber: normalizedPlate, status: 'active' }
         });
 
         if (existingTicket) {
@@ -63,10 +65,9 @@ const createTicket = async (req, res, next) => {
             });
         }
 
-        // Generate ticket number and QR code before creating ticket
+        // Create ticket
         const ticketNumber = `TKT-${Date.now()}-${Math.random().toString(36).slice(2, 11).toUpperCase()}`;
-        
-        // Generate QR code with entryTime included
+
         const qrCodeData = await qrService.generateTicketQR({
             ticketNumber,
             plateNumber: normalizedPlate,
@@ -74,7 +75,6 @@ const createTicket = async (req, res, next) => {
             vehicleType
         });
 
-        // create the ticket with qrCodeData
         const ticket = await Ticket.create({
             ticketNumber,
             qrCodeData,
@@ -85,6 +85,12 @@ const createTicket = async (req, res, next) => {
             notes,
             entryTime: new Date()
         });
+
+        // Fetch parking identity for print
+        const [parkingName, parkingAddress] = await Promise.all([
+            Setting.get('parking_name', 'Smart Parking'),
+            Setting.get('parking_address', '')
+        ]);
 
         // Log activity
         await ActivityLog.log({
@@ -115,6 +121,10 @@ const createTicket = async (req, res, next) => {
                     qrCodeData: ticket.qrCodeData,
                     status: ticket.status
                 },
+                // Parking identity included so the client can use them for printing
+                // without needing a separate authenticated settings request
+                parkingName,
+                parkingAddress,
                 hasMonthlyPass: !!monthlyPass,
                 monthlyPass: monthlyPass ? {
                     passNumber: monthlyPass.passNumber,
@@ -134,8 +144,6 @@ const getTicket = async (req, res, next) => {
         const { identifier } = req.params;
 
         let ticket;
-
-        // Check if identifier is numeric (ID) or string (ticket number)
         if (/^\d+$/.test(identifier)) {
             ticket = await Ticket.findByPk(identifier, {
                 include: [
@@ -154,20 +162,13 @@ const getTicket = async (req, res, next) => {
         }
 
         if (!ticket) {
-            return res.status(404).json({
-                success: false,
-                message: 'Ticket not found'
-            });
+            return res.status(404).json({ success: false, message: 'Ticket not found' });
         }
 
-        // Get rate for cost calculation
         const rate = await Rate.getActiveRate(ticket.vehicleType);
         const duration = ticket.getDurationMinutes();
-
         let estimatedCost = 0;
-        if (rate && ticket.status === 'active') {
-            estimatedCost = calculateCost(duration, rate);
-        }
+        if (rate && ticket.status === 'active') estimatedCost = calculateCost(duration, rate);
 
         res.json({
             success: true,
@@ -193,37 +194,15 @@ const getTicket = async (req, res, next) => {
 // Search tickets
 const searchTickets = async (req, res, next) => {
     try {
-        const {
-            plateNumber,
-            ticketNumber,
-            status,
-            vehicleType,
-            fromDate,
-            toDate,
-            page = 1,
-            limit = 20
-        } = req.query;
+        const { plateNumber, ticketNumber, status, vehicleType, fromDate, toDate, page = 1, limit = 20 } = req.query;
 
         const where = {};
-
-        if (plateNumber) {
-            where.plateNumber = { [Op.like]: `%${plateNumber.toUpperCase()}%` };
-        }
-        if (ticketNumber) {
-            where.ticketNumber = { [Op.like]: `%${ticketNumber}%` };
-        }
-        if (status) {
-            where.status = status;
-        }
-        if (vehicleType) {
-            where.vehicleType = vehicleType;
-        }
-        if (fromDate) {
-            where.entryTime = { ...where.entryTime, [Op.gte]: new Date(fromDate) };
-        }
-        if (toDate) {
-            where.entryTime = { ...where.entryTime, [Op.lte]: new Date(toDate) };
-        }
+        if (plateNumber) where.plateNumber = { [Op.like]: `%${plateNumber.toUpperCase()}%` };
+        if (ticketNumber) where.ticketNumber = { [Op.like]: `%${ticketNumber}%` };
+        if (status) where.status = status;
+        if (vehicleType) where.vehicleType = vehicleType;
+        if (fromDate) where.entryTime = { ...where.entryTime, [Op.gte]: new Date(fromDate) };
+        if (toDate) where.entryTime = { ...where.entryTime, [Op.lte]: new Date(toDate) };
 
         const offset = (parseInt(page) - 1) * parseInt(limit);
 
@@ -279,10 +258,7 @@ const getActiveTickets = async (req, res, next) => {
 
         res.json({
             success: true,
-            data: {
-                tickets: formattedTickets,
-                total: tickets.length
-            }
+            data: { tickets: formattedTickets, total: tickets.length }
         });
     } catch (error) {
         next(error);
@@ -292,31 +268,24 @@ const getActiveTickets = async (req, res, next) => {
 // Get current user's tickets (Customer)
 const getMyTickets = async (req, res, next) => {
     try {
-        const userId = req.userId;
-
         const tickets = await Ticket.findAll({
-            where: { 
-                status: 'active',
-                userId: userId
-            },
+            where: { status: 'active', userId: req.userId },
             order: [['entryTime', 'DESC']],
             attributes: ['id', 'ticketNumber', 'plateNumber', 'vehicleType', 'entryTime', 'parkingSpot', 'qrCodeData']
         });
 
-        const formattedTickets = tickets.map(t => ({
-            id: t.id,
-            ticketNumber: t.ticketNumber,
-            plateNumber: t.plateNumber,
-            vehicleType: t.vehicleType,
-            entryTime: t.entryTime,
-            parkingSpot: t.parkingSpot,
-            qrCodeData: t.qrCodeData
-        }));
-
         res.json({
             success: true,
             data: {
-                tickets: formattedTickets,
+                tickets: tickets.map(t => ({
+                    id: t.id,
+                    ticketNumber: t.ticketNumber,
+                    plateNumber: t.plateNumber,
+                    vehicleType: t.vehicleType,
+                    entryTime: t.entryTime,
+                    parkingSpot: t.parkingSpot,
+                    qrCodeData: t.qrCodeData
+                })),
                 total: tickets.length
             }
         });
@@ -338,22 +307,20 @@ const printTicket = async (req, res, next) => {
         }
 
         if (!ticket) {
-            return res.status(404).json({
-                success: false,
-                message: 'Tiket tidak ditemukan'
-            });
+            return res.status(404).json({ success: false, message: 'Tiket tidak ditemukan' });
         }
 
-        // Log the reprint activity
+        const [parkingName, parkingAddress] = await Promise.all([
+            Setting.get('parking_name', 'Smart Parking'),
+            Setting.get('parking_address', '')
+        ]);
+
         await ActivityLog.create({
             userId: req.userId,
             action: 'TICKET_REPRINTED',
             entityType: 'ticket',
             entityId: ticket.id,
-            details: {
-                ticketNumber: ticket.ticketNumber,
-                plateNumber: ticket.plateNumber
-            },
+            details: { ticketNumber: ticket.ticketNumber, plateNumber: ticket.plateNumber },
             ipAddress: req.ip
         });
 
@@ -368,7 +335,9 @@ const printTicket = async (req, res, next) => {
                 entryTime: ticket.entryTime,
                 parkingSpot: ticket.parkingSpot,
                 qrCodeData: ticket.qrCodeData,
-                formattedDuration: formatDuration(ticket.entryTime)
+                formattedDuration: formatDuration(ticket.entryTime),
+                parkingName,
+                parkingAddress
             }
         });
     } catch (error) {
@@ -376,7 +345,6 @@ const printTicket = async (req, res, next) => {
     }
 };
 
-// Helper function to format duration
 function formatDuration(entryTime) {
     const minutes = Math.floor((Date.now() - new Date(entryTime).getTime()) / 60000);
     if (minutes < 60) return `${minutes}m`;
@@ -399,10 +367,7 @@ const markTicketLost = async (req, res, next) => {
         }
 
         if (!ticket) {
-            return res.status(404).json({
-                success: false,
-                message: 'Active ticket not found'
-            });
+            return res.status(404).json({ success: false, message: 'Active ticket not found' });
         }
 
         await ticket.update({
@@ -419,80 +384,55 @@ const markTicketLost = async (req, res, next) => {
             ipAddress: req.ip
         });
 
-        res.json({
-            success: true,
-            message: 'Ticket marked as lost',
-            data: { ticket }
-        });
+        res.json({ success: true, message: 'Ticket marked as lost', data: { ticket } });
     } catch (error) {
         next(error);
     }
 };
 
-// Cancel ticket
+// Cancel/delete ticket
 const cancelTicket = async (req, res, next) => {
     try {
         const { id } = req.params;
-        const { reason } = req.body;
 
         const ticket = await Ticket.findByPk(id);
-
         if (!ticket) {
-            return res.status(404).json({
-                success: false,
-                message: 'Ticket not found'
-            });
+            return res.status(404).json({ success: false, message: 'Tiket tidak ditemukan' });
         }
 
-        if (ticket.status !== 'active') {
-            return res.status(400).json({
-                success: false,
-                message: 'Only active tickets can be cancelled'
-            });
-        }
-
-        await ticket.update({
-            status: 'cancelled',
-            notes: `CANCELLED - ${reason || 'No reason provided'}`
-        });
-
-        await ActivityLog.log({
+        await ActivityLog.create({
             userId: req.userId,
-            action: 'TICKET_CANCELLED',
+            action: 'TICKET_DELETED',
             entityType: 'ticket',
             entityId: ticket.id,
-            details: { ticketNumber: ticket.ticketNumber, reason },
+            details: {
+                ticketNumber: ticket.ticketNumber,
+                plateNumber: ticket.plateNumber,
+                status: ticket.status,
+                deletedReason: 'Manual deletion - lost ticket'
+            },
             ipAddress: req.ip
         });
 
+        await ticket.destroy();
+
         res.json({
             success: true,
-            message: 'Ticket cancelled',
-            data: { ticket }
+            message: 'Tiket berhasil dihapus',
+            data: { deletedTicketNumber: ticket.ticketNumber }
         });
     } catch (error) {
         next(error);
     }
 };
 
-// Helper function for cost calculation
 function calculateCost(durationMinutes, rate) {
     const gracePeriod = rate.gracePeriodMinutes || 0;
-
-    if (durationMinutes <= gracePeriod) {
-        return 0;
-    }
-
+    if (durationMinutes <= gracePeriod) return 0;
     const billableMinutes = durationMinutes - gracePeriod;
     const hours = Math.ceil(billableMinutes / 60);
-
     let cost = hours * parseFloat(rate.ratePerHour);
-
-    // Apply daily max if set
-    if (rate.dailyMax && cost > parseFloat(rate.dailyMax)) {
-        cost = parseFloat(rate.dailyMax);
-    }
-
+    if (rate.dailyMax && cost > parseFloat(rate.dailyMax)) cost = parseFloat(rate.dailyMax);
     return Math.round(cost);
 }
 
